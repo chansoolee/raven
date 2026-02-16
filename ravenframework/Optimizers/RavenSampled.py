@@ -123,6 +123,7 @@ class RavenSampled(Optimizer):
     self._optPointHistory = {}  # a dictionary of deque's by traj (-1 is most recent)
     self._maxHistLen = 2  # FIXME who should set this?
     self._rerunsSinceAccept = {} # by traj, how long since our last accepted point
+    self._evaluatedSubmissionKeys = set()  # set of previously evaluated sampled points for deduplication
     # __private
     self.__stepCounter = {}  # tracks the "generation" or "iteration" of each trajectory -> iteration is defined by inheritor
     # additional methods
@@ -322,6 +323,7 @@ class RavenSampled(Optimizer):
       rlz[objVar] *= self._objMult[objVar] #multiply by -1 to maximize obj or by 1 to minimize obj
     # TODO FIXME let normalizeData work on an xr.DataSet (batch) not just a dictionary!
     rlz = self.normalizeData(rlz)
+    self._cacheEvaluatedSubmissionPoints(rlz)
     self._useRealization(info, rlz)
 
   def finalizeSampler(self, failedRuns): #!TODO: is this unused??
@@ -453,10 +455,62 @@ class RavenSampled(Optimizer):
     self._rerunsSinceAccept = {}
     self.__stepCounter = {}
     self._submissionQueue = deque()
+    self._evaluatedSubmissionKeys = set()
 
   ###################
   # Utility Methods #
   ###################
+  def _makeSubmissionKey(self, point):
+    """
+      Creates a hashable key from sampled variable values in a point.
+      @ In, point, dict, sampled variable values for a single realization
+      @ Out, key, tuple, hashable representation of the sampled point
+    """
+    key = []
+    for var in sorted(self.toBeSampled.keys()):
+      val = point[var]
+      if hasattr(val, 'values'):
+        val = val.values
+      if hasattr(val, 'data'):
+        val = val.data
+      arr = np.asarray(val).reshape(-1)
+      key.append(tuple(int(x) for x in arr))
+    return tuple(key)
+
+  def _cacheEvaluatedSubmissionPoints(self, rlz):
+    """
+      Caches evaluated points so later duplicate submissions can be skipped.
+      @ In, rlz, dict or xr.Dataset, normalized realization(s)
+      @ Out, None
+    """
+    if not self._deduplication:
+      return
+    if isinstance(rlz, dict):
+      self._evaluatedSubmissionKeys.add(self._makeSubmissionKey(rlz))
+      return
+    if 'RAVEN_sample_ID' not in rlz.sizes:
+      return
+    for i in range(rlz.sizes['RAVEN_sample_ID']):
+      point = {var: np.atleast_1d(rlz[var].data)[i] for var in self.toBeSampled}
+      self._evaluatedSubmissionKeys.add(self._makeSubmissionKey(point))
+
+  def _queueSubmission(self, point, info, force=False):
+    """
+      Adds a run to the submission queue, optionally skipping duplicates.
+      @ In, point, dict, normalized point to submit
+      @ In, info, dict, run tracking information
+      @ In, force, bool, optional, if True bypass duplicate filtering
+      @ Out, queued, bool, True if point was queued
+    """
+    if self._deduplication and not force:
+      key = self._makeSubmissionKey(point)
+      if key in self._evaluatedSubmissionKeys:
+        self.raiseADebug(f'Skipping duplicate run: {self.denormalizeData(point)} | {info}')
+        return False
+    self.raiseADebug(f'Adding run to queue: {self.denormalizeData(point)} | {info}')
+    self._submissionQueue.append((point, info))
+    return True
+
   def incrementIteration(self, traj):
     """
       Increments the "generation" or "iteration" of an optimization algorithm.
