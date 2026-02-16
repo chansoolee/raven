@@ -1,0 +1,36 @@
+flowchart TD
+  A[Optimizer.initialize] --> B[initializeTrajectory]
+  B --> C[Algorithm.initialize<br/>e.g. GA.initialize]
+  C --> D["_submitRun(point, traj, step)"]
+  D --> E["_queueSubmission(point, info, force)"]
+  
+  E -->|dedup off OR force=true| Q[submissionQueue.append]
+  E -->|dedup on AND force=false| K["_makeSubmissionKey(point)"]
+  
+  K --> M{key in _evaluatedSubmissionKeys?}
+  M -->|Yes| S[Skip duplicate / return False]
+  M -->|No| Q
+  
+  Q --> G[amIreadyToProvideAnInput]
+  G --> H[localGenerateInput]
+  H --> I[Pop queue + denormalizeData + build inputInfo]
+  I --> J[Model run via JobHandler]
+  J --> L[localFinalizeActualSampling]
+  L --> N[Read realization from TargetEvaluation]
+  N --> O[Objective sign fix + normalizeData]
+  O --> P["_cacheEvaluatedSubmissionPoints(rlz)"]
+  P --> R["Algorithm._useRealization(info, rlz)"]
+  R["Algorithm._useRealization(info, rlz)"] --> U{Converged or limit reached?}
+  U -->|No| T[Generate next candidates]
+  T --> D["_submitRun(point, traj, step)"]
+  U -->|Yes| V[_closeTrajectory / no active traj]
+  V --> W[finalizeSampler]
+
+  CA ~~~ LEGEND
+  LEGEND["<br/>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <font size='5'><b>[ Variable Legend ]</b></font> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<br/><br/>• <b>point</b>: one candidate solution dict<br/>• <b>traj</b>: trajectory id &nbsp; <br/>• <b>step</b>: iteration/generation index<br/>• <b>info</b>: run metadata dict &nbsp; <br/>• <b>force</b>: bypass dedup when true &nbsp; <br/>• <b>rlz</b>: realization result dict<br/>• <b>key</b>: hashable tuple from point &nbsp; <br/>• <b>evaluated set</b>: keys already evaluated<br/> "]
+    
+
+  style LEGEND fill:none,stroke:none,text-align:left
+  style CA fill:none, stroke:none, color:#000000
+
+
