@@ -360,6 +360,7 @@ class GeneticAlgorithm(RavenSampled):
     self._repairInstance = None                                  # instance of repair
     self._canHandleMultiObjective = True                         # boolean indicator whether optimization is a sinlge-objective problem or a multi-objective problem
     self._sampledPopulationInfo = {}                             # stores population and fitness info
+    self._pendingStoredDedupedRuns = []                          # stored deduplicated realizations to include in next _useRealization evaluation
   ##########################
   # Initialization Methods #
   ##########################
@@ -802,6 +803,54 @@ class GeneticAlgorithm(RavenSampled):
   ######################################################################################
 
   ## TODO: We have to estimate the max number of unique chromosomes and make sure population size doesn't exceed that number. Or should it?
+  def _collectStoredDedupedRun(self, point):
+    """
+      Collect a stored realization from solution export for GA dedup reuse.
+      @ In, point, dict, sampled variable values for a skipped submission
+      @ Out, stored, dict or None, stored realization values if available
+    """
+    if not (self._deduplication and self._writeSteps == 'every'):
+      return None
+    if self._solutionExport is None:
+      return None
+    denormPoint = self.denormalizeData(point)
+    matchDict = {var: denormPoint[var] for var in self.toBeSampled if var in denormPoint}
+    if len(matchDict) != len(self.toBeSampled):
+      return None
+    _, storedRlz = self._solutionExport.realization(matchDict=matchDict)
+    if storedRlz is None:
+      return None
+    return dict((var, np.atleast_1d(val)[0]) for var, val in storedRlz.items())
+
+  def _extendDatasetWithStoredRuns(self, rlz):
+    """
+      Extend a realization dataset with pending stored deduplicated runs.
+      @ In, rlz, xr.Dataset, evaluated realizations
+      @ Out, rlz, xr.Dataset, augmented realizations
+    """
+    if not self._pendingStoredDedupedRuns:
+      return rlz
+    if 'RAVEN_sample_ID' not in rlz.sizes:
+      self._pendingStoredDedupedRuns = []
+      return rlz
+    varsInRlz = list(rlz.data_vars)
+    reusableStored = [entry for entry in self._pendingStoredDedupedRuns if all(var in entry for var in varsInRlz)]
+    self._pendingStoredDedupedRuns = []
+    if not reusableStored:
+      return rlz
+
+    oldSize = rlz.sizes['RAVEN_sample_ID']
+    newSize = oldSize + len(reusableStored)
+    coords = {'RAVEN_sample_ID': np.arange(newSize)}
+    extended = xr.Dataset()
+    for var in varsInRlz:
+      base = np.atleast_1d(rlz[var].data)
+      extra = np.asarray([entry[var] for entry in reusableStored], dtype=base.dtype)
+      extended[var] = xr.DataArray(np.concatenate((base, extra)),
+                                   dims=['RAVEN_sample_ID'],
+                                   coords=coords)
+    return extended
+
   def _useRealization(self, info, rlz):
     """
       Used to feedback the collected runs into actionable items within the sampler.
@@ -816,6 +865,7 @@ class GeneticAlgorithm(RavenSampled):
       self._closeTrajectory(t, 'cancel', 'Currently GA is single trajectory', 0)
     self.incrementIteration(traj)
 
+    rlz = self._extendDatasetWithStoredRuns(rlz)
 
     currentPopInputs = datasetToDataArray(rlz, list(self.toBeSampled))
 
@@ -1026,7 +1076,12 @@ class GeneticAlgorithm(RavenSampled):
     info.update({'traj': traj,
                   'step': step
                 })
-    return self._queueSubmission(point, info, force=force)
+    queued = self._queueSubmission(point, info, force=force)
+    if (not queued) and self._deduplication and self._writeSteps == 'every':
+      stored = self._collectStoredDedupedRun(point)
+      if stored is not None:
+        self._pendingStoredDedupedRuns.append(deepcopy(stored))
+    return queued
 
   def flush(self):
     """
@@ -1052,6 +1107,7 @@ class GeneticAlgorithm(RavenSampled):
     self.multiBestConstraint = None
     self.multiBestRank = None
     self.multiBestCD = None
+    self._pendingStoredDedupedRuns = []
 
   # END queuing Runs
   # * * * * * * * * * * * * * * * *
