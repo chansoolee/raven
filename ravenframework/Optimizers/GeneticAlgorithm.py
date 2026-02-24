@@ -360,7 +360,9 @@ class GeneticAlgorithm(RavenSampled):
     self._repairInstance = None                                  # instance of repair
     self._canHandleMultiObjective = True                         # boolean indicator whether optimization is a sinlge-objective problem or a multi-objective problem
     self._sampledPopulationInfo = {}                             # stores population and fitness info
-
+    # Deduplication: skip re-evaluation of previously evaluated individuals
+    self._deduplication = False                                  # on/off toggle for skipping duplicate evaluations
+    self._evaluatedIndividuals = set()                           # set of hashable keys (tuples) for all evaluated chromosomes across generations
   ##########################
   # Initialization Methods #
   ##########################
@@ -573,6 +575,20 @@ class GeneticAlgorithm(RavenSampled):
         descr=r""" normalize: input and output data will be normalized prior to calculating fitness for each iteration of the optimizer. \default{zscore}""")
     fitness.addSub(normalizeFitness)
     GAparams.addSub(fitness)
+
+    # Deduplication
+    deduplication = InputData.parameterInputFactory('deduplication', strictMode=True,
+        contentType=InputTypes.BoolType,
+        printPriority=108,
+        descr=r"""If True, enables deduplication of the population across generations.
+                  When a new generation of children is created, any individual whose
+                  gene combination has already been evaluated in a previous generation
+                  will be skipped (not submitted for simulation), saving computational cost.
+                  The optimizer tracks all uniquely evaluated individuals using a
+                  memory-efficient set of hash keys.
+                  \default{False}""")
+    GAparams.addSub(deduplication)
+
     specs.addSub(GAparams)
 
     # convergence
@@ -740,6 +756,13 @@ class GeneticAlgorithm(RavenSampled):
     self._repairInstance = repairReturnInstance(self,name='replacementRepair')  # currently only replacement repair is implemented.
 
     ####################################################################################
+    # deduplication node                                                               #
+    ####################################################################################
+    deduplicationNode = gaParamsNode.findFirst('deduplication')
+    if deduplicationNode is not None:
+      self._deduplication = deduplicationNode.value
+
+    ####################################################################################
     # convergence criterion node                                                       #
     ####################################################################################
     convNode = paramInput.findFirst('convergence')
@@ -818,6 +841,10 @@ class GeneticAlgorithm(RavenSampled):
 
 
     currentPopInputs = datasetToDataArray(rlz, list(self.toBeSampled))
+
+    # Cache evaluated individuals for deduplication (track all chromosomes seen so far)
+    if self._deduplication:
+      self._cacheEvaluatedPopulation(currentPopInputs)
 
     currentPop_objvals = []
     for i in range(len(self._objectiveVar)):
@@ -983,15 +1010,52 @@ class GeneticAlgorithm(RavenSampled):
                                         'Gene':list(self.toBeSampled)})
 
   ## 10. Submit children batch
+      # First, build a list of all children as dicts
+      childrenToSubmit = []
+
       # Submit children coordinates (x1,...,xm), i.e., self.childrenCoordinates
       for i in range(self.batch):
         newRlz = {}
         for _, var in enumerate(self.toBeSampled.keys()):
           newRlz[var] = float(daChildren.loc[i, var].values)
-        self._submitRun(newRlz, traj, self.getIteration(traj))
+
+        childrenToSubmit.append(newRlz)
+
+      for child in childrenToSubmit:
+        self._submitRun(child, traj, self.getIteration(traj))
 
   ## 11. Save grandparents
     self.prevPop_inputs = deepcopy(currentPopInputs)
+
+  def _makePopulationKey(self, point):
+    """
+      Creates a hashable key from a population member's variable values
+      for use in duplicate detection.
+      Uses sorted variable names for consistent ordering, with values
+      rounded to 10 decimal places to handle floating-point noise.
+      @ In, point, dict, {varName: value} for a single population member
+      @ Out, key, tuple, hashable representation of the point
+    """
+    return tuple(round(float(point[var]), 10) for var in sorted(self.toBeSampled.keys()))
+
+  def _cacheEvaluatedPopulation(self, population):
+    """
+      Adds all individuals from the population DataArray to the evaluated cache.
+      Called at the start of each generation to register newly evaluated chromosomes.
+      @ In, population, xr.DataArray, population with dims ['chromosome', 'Gene']
+      @ Out, None
+    """
+    newCount = 0
+    for i in range(population.shape[0]):
+      point = {str(var): float(population.loc[i, var].values)
+               for var in population.coords['Gene'].values}
+      cacheKey = self._makePopulationKey(point)
+      if cacheKey not in self._evaluatedIndividuals:
+        self._evaluatedIndividuals.add(cacheKey)
+        newCount += 1
+    if newCount > 0:
+      self.raiseADebug(f'Deduplication: cached {newCount} new individual(s). '
+                       f'Total unique evaluations: {len(self._evaluatedIndividuals)}')
 
   def _submitRun(self, point, traj, step, moreInfo=None):
     """
@@ -1000,7 +1064,7 @@ class GeneticAlgorithm(RavenSampled):
       @ In, traj, int, trajectory identifier
       @ In, step, int, iteration number identifier
       @ In, moreInfo, dict, optional, additional run-identifying information to track
-      @ Out, None
+      @ Out, queued, bool, True if the run was queued
     """
     info = {}
     if moreInfo is not None:
@@ -1008,10 +1072,7 @@ class GeneticAlgorithm(RavenSampled):
     info.update({'traj': traj,
                   'step': step
                 })
-    # NOTE: Currently, GA treats explicit and implicit constraints similarly
-    # while box constraints (Boundary constraints) are automatically handled via limits of the distribution
-    self.raiseADebug(f'Adding run to queue: {self.denormalizeData(point)} | {info}')
-    self._submissionQueue.append((point, info))
+    return self._queueSubmission(point, info)
 
   def flush(self):
     """
@@ -1031,6 +1092,7 @@ class GeneticAlgorithm(RavenSampled):
     self.hdsm = np.NaN
     self.bestPoint = None
     self.bestFitness = None
+    self._evaluatedIndividuals = set()
     self.multiBestPoint = None
     self.multiBestFitness = None
     self.multiBestObjective = None

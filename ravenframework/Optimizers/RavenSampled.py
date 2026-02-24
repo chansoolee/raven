@@ -26,6 +26,7 @@ import abc
 from collections import deque
 import copy
 import numpy as np
+import xarray as xr
 # External Modules End------------------------------------------------------------------------------
 
 # Internal Modules----------------------------------------------------------------------------------
@@ -123,6 +124,9 @@ class RavenSampled(Optimizer):
     self._optPointHistory = {}  # a dictionary of deque's by traj (-1 is most recent)
     self._maxHistLen = 2  # FIXME who should set this?
     self._rerunsSinceAccept = {} # by traj, how long since our last accepted point
+    self._evaluatedSubmissionKeys = set()  # set of previously evaluated sampled points for deduplication
+    self._evaluatedSubmissionData = {}  # map of sampled point key -> normalized realization for dedup reuse
+    self._deduplicatedSubmissions = []  # duplicate submissions to merge during finalize
     # __private
     self.__stepCounter = {}  # tracks the "generation" or "iteration" of each trajectory -> iteration is defined by inheritor
     # additional methods
@@ -226,9 +230,17 @@ class RavenSampled(Optimizer):
     """
     # if any trajectories are still active, we're ready to provide an input
     ready = Optimizer.amIreadyToProvideAnInput(self)
+
+    # if all rlz are deduplicated, localFinalizeActualSampling (_useRealization) will not run, thus _submissionQueue will be empty.
+    # Multirun will be breaked (line 247 of MultiRun.py) _useRealization for reproduction with deduplicated rlz is applied.
+    if ready and len(self._submissionQueue) == 0 and self._deduplicatedSubmissions and len(self._prefixToIdentifiers) == 0:
+      self.raiseADebug('No queued runs remain; restoring deduplicated submissions from cache.')
+      restoredInfo, restoredRlz = self._restoreDeduplicatedSubmissions()
+      if restoredRlz is not None:
+        self._useRealization(restoredInfo, restoredRlz)
+
     # we're not ready yet if we don't have anything in queue
     ready = ready and len(self._submissionQueue) != 0
-
     return ready
 
   def localGenerateInput(self, model, inp):
@@ -240,13 +252,14 @@ class RavenSampled(Optimizer):
       @ In, inp, list, a list of the original needed inputs for the model (e.g. list of files, etc.)
       @ Out, None
     """
+    runsToGenerate = min(self.batch, len(self._submissionQueue))
     if self.batch > 1:
       self.inputInfo['batchMode'] = True
       batchData = []
       self.batchId += 1
     else:
       self.inputInfo['batchMode'] = False
-    for _ in range(self.batch):
+    for _ in range(runsToGenerate):
       inputInfo = {'SampledVarsPb':{}, 'batchMode':self.inputInfo['batchMode']}  # ,'prefix': str(self.batchId)+'_'+str(i)
       if self.counter == self.limit + 1:
         break
@@ -279,7 +292,7 @@ class RavenSampled(Optimizer):
         inputInfo['batchId'] = self.batchId
         self.inputInfo.update(inputInfo)
     if self.batch > 1:
-      self.inputInfo['batchInfo'] = {'nRuns': self.batch, 'batchRealizations': batchData, 'batchId': str('gen_' + str(self.batchId))}
+      self.inputInfo['batchInfo'] = {'nRuns': len(batchData), 'batchRealizations': batchData, 'batchId': str('gen_' + str(self.batchId))}
 
   # @profile
   def localFinalizeActualSampling(self, jobObject, model, myInput):
@@ -322,7 +335,10 @@ class RavenSampled(Optimizer):
       rlz[objVar] *= self._objMult[objVar] #multiply by -1 to maximize obj or by 1 to minimize obj
     # TODO FIXME let normalizeData work on an xr.DataSet (batch) not just a dictionary!
     rlz = self.normalizeData(rlz)
-    self._useRealization(info, rlz)
+    self._cacheEvaluatedSubmissionPoints(rlz)
+    restoredInfo, restoredRlz = self._restoreDeduplicatedSubmissions(info, rlz)
+    if restoredRlz is not None:
+      self._useRealization(restoredInfo, restoredRlz)
 
   def finalizeSampler(self, failedRuns): #!TODO: is this unused??
     """
@@ -453,10 +469,157 @@ class RavenSampled(Optimizer):
     self._rerunsSinceAccept = {}
     self.__stepCounter = {}
     self._submissionQueue = deque()
+    self._evaluatedSubmissionKeys = set()
+    self._evaluatedSubmissionData = {}
+    self._deduplicatedSubmissions = []
 
   ###################
   # Utility Methods #
   ###################
+  def _makeSubmissionKey(self, point):
+    """
+      Creates a hashable key from sampled variable values in a point.
+      @ In, point, dict, sampled variable values for a single realization
+      @ Out, key, tuple, hashable representation of the sampled point
+    """
+    key = []
+    for var in sorted(self.toBeSampled.keys()):
+      val = point[var]
+      if hasattr(val, 'values'):
+        val = val.values
+      if hasattr(val, 'data'):
+        val = val.data
+      arr = np.asarray(val).reshape(-1)
+      key.append(tuple(int(x) for x in arr))
+    return tuple(key)
+
+  def _cacheEvaluatedSubmissionPoints(self, rlz):
+    """
+      Caches evaluated points so later duplicate submissions can be skipped.
+      @ In, rlz, dict or xr.Dataset, normalized realization(s)
+      @ Out, None
+    """
+    if not self._deduplication:
+      return
+    if isinstance(rlz, dict):
+      key = self._makeSubmissionKey(rlz)
+      self._evaluatedSubmissionKeys.add(key)
+      self._evaluatedSubmissionData[key] = copy.deepcopy(rlz)
+      return
+    if 'RAVEN_sample_ID' not in rlz.sizes:
+      return
+    for i in range(rlz.sizes['RAVEN_sample_ID']):
+      point = {var: np.atleast_1d(rlz[var].data)[i] for var in self.toBeSampled}
+      key = self._makeSubmissionKey(point)
+      self._evaluatedSubmissionKeys.add(key)
+      cached = rlz.isel({'RAVEN_sample_ID': [i]}).copy(deep=True)
+      self._evaluatedSubmissionData[key] = cached
+
+  def _recordDeduplicatedSubmission(self, key, info):
+    """
+      Records a duplicate submission for dedup processing in finalize.
+      @ In, key, tuple, hashable key for sampled point
+      @ In, info, dict, run tracking information
+      @ Out, recorded, bool, True if duplicate was recorded
+    """
+    self.raiseADebug(f'Recording duplicate run for dedup processing: {info}')
+    self._deduplicatedSubmissions.append((key, copy.deepcopy(info)))
+    return True
+
+  def _overwriteBatchId(self, rlz):
+    """
+      Overwrite batchId in restored realizations with the current optimizer batch.
+      @ In, rlz, dict or xr.Dataset, realization(s) to update
+      @ Out, updated, dict or xr.Dataset, realization(s) with updated batchId
+    """
+    if rlz is None:
+      return None
+    if isinstance(rlz, dict):
+      updated = copy.deepcopy(rlz)
+      updated['batchId'] = self.batchId
+      return updated
+    if isinstance(rlz, xr.Dataset):
+      updated = rlz.copy(deep=True)
+      sampleDim = None
+      if 'RAVEN_sample_ID' in updated.sizes:
+        sampleDim = 'RAVEN_sample_ID'
+      elif len(updated.sizes) == 1:
+        sampleDim = next(iter(updated.sizes))
+      if sampleDim is None:
+        updated['batchId'] = self.batchId
+      else:
+        updated['batchId'] = xr.DataArray(np.full(updated.sizes[sampleDim], self.batchId), dims=[sampleDim])
+      return updated
+    return rlz
+
+  def _restoreDeduplicatedSubmissions(self, info=None, rlz=None):
+    """
+      Restores deduplicated submissions by combining cached realizations
+      with an optional freshly evaluated realization.
+      This method only prepares merged/restored realizations; it does not call _useRealization.
+      @ In, info, dict, optional, tracking information for rlz
+      @ In, rlz, dict or xr.Dataset, optional, freshly evaluated normalized realization
+      @ Out, restoredInfo, dict or None, tracking information for restored rlz
+      @ Out, restoredRlz, dict or xr.Dataset or None, realization ready for _useRealization
+    """
+    pendingDedup = self._deduplicatedSubmissions
+    self._deduplicatedSubmissions = []
+    datasetRestores = []
+    dictRestores = []
+    for key, dedupInfo in pendingDedup:
+      cached = self._evaluatedSubmissionData.get(key)
+      if isinstance(cached, xr.Dataset):
+        datasetRestores.append((key, copy.deepcopy(dedupInfo), copy.deepcopy(cached)))
+      elif isinstance(cached, dict):
+        dictRestores.append((key, copy.deepcopy(dedupInfo), copy.deepcopy(cached)))
+
+    if isinstance(rlz, xr.Dataset):
+      mergedPieces = [rlz]
+      mergedInfo = copy.deepcopy(info)
+      if datasetRestores:
+        mergedPieces.extend([cached for _, _, cached in datasetRestores])
+      if dictRestores:
+        self._deduplicatedSubmissions.extend([(key, dedupInfo) for key, dedupInfo, _ in dictRestores])
+      return mergedInfo, self._overwriteBatchId(xr.concat(mergedPieces, dim='RAVEN_sample_ID'))
+
+    if rlz is not None:
+      if datasetRestores:
+        self._deduplicatedSubmissions.extend([(key, dedupInfo) for key, dedupInfo, _ in datasetRestores])
+      if dictRestores:
+        self._deduplicatedSubmissions.extend([(key, dedupInfo) for key, dedupInfo, _ in dictRestores])
+      return copy.deepcopy(info), self._overwriteBatchId(rlz)
+
+    if dictRestores:
+      key, dedupInfo, cached = dictRestores[0]
+      if len(dictRestores) > 1:
+        self._deduplicatedSubmissions.extend([(k, i) for k, i, _ in dictRestores[1:]])
+      if datasetRestores:
+        self._deduplicatedSubmissions.extend([(k, i) for k, i, _ in datasetRestores])
+      return dedupInfo, self._overwriteBatchId(cached)
+
+    if datasetRestores:
+      merged = xr.concat([cached for _, _, cached in datasetRestores], dim='RAVEN_sample_ID')
+      return datasetRestores[0][1], self._overwriteBatchId(merged)
+
+    return None, None
+
+  def _queueSubmission(self, point, info):
+    """
+      Adds a run to the submission queue, skipping duplicates when deduplication is active.
+      @ In, point, dict, normalized point to submit
+      @ In, info, dict, run tracking information
+      @ Out, queued, bool, True if point was queued
+    """
+    if self._deduplication:
+      key = self._makeSubmissionKey(point)
+      if key in self._evaluatedSubmissionKeys:
+        self.raiseADebug(f'Skipping duplicate run: {self.denormalizeData(point)} | {info}')
+        self._recordDeduplicatedSubmission(key, info)
+        return False
+    self.raiseADebug(f'Adding run to queue: {self.denormalizeData(point)} | {info}')
+    self._submissionQueue.append((point, info))
+    return True
+
   def incrementIteration(self, traj):
     """
       Increments the "generation" or "iteration" of an optimization algorithm.
