@@ -36,13 +36,17 @@ def dataArrayToDict(singlePointDataArray):
 def datasetToDataArray(rlzDataset,vars):
   """
     Converts the realization DataSet to a DataArray
-    @ In, rlzDataset, xr.dataset, the data set containing the batched realizations
+    @ In, rlzDataset, xr.dataset or dict, the data set containing the batched realizations
     @ In, vars, list, the list of decision variables
     @ Out, dataset, xr.dataarray, a data array containing the realization with
                    dims = ['chromosome','Gene']
                    chromosomes are named 0,1,2...
                    Genes are named after variables to be sampled
   """
+  # When batch=1, the optimizer passes a plain dict instead of an xr.Dataset.
+  # Convert it to an xr.Dataset so the rest of the logic is uniform.
+  if isinstance(rlzDataset, dict):
+    rlzDataset = xr.Dataset({k: xr.DataArray(np.atleast_1d(v)) for k, v in rlzDataset.items()})
   dataset = xr.DataArray(np.atleast_2d(rlzDataset[vars].to_array().transpose()),
                             dims=['chromosome','Gene'],
                             coords={'chromosome': np.arange(rlzDataset[vars[0]].data.size),

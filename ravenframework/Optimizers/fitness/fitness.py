@@ -134,7 +134,8 @@ def feasibleFirst(rlz, **kwargs):
   # For each objective
   for i, obj in enumerate(objVar):
       data = np.atleast_1d(rlz[obj].data)
-      worstObj = max(data) # Worst objective value for penalizing violating solutions
+      finiteData = data[np.isfinite(data)]
+      worstObj = max(finiteData) if len(finiteData) > 0 else max(data)
       fitness = np.zeros(data.shape)
       for ind in range(data.shape[0]):
           # If no contraints or all constraints are satisfied

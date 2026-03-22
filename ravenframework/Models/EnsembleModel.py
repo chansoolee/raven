@@ -532,7 +532,54 @@ class EnsembleModel(Dummy):
     Input = self.createNewInput(myInput[0], samplerType, **kwargsToKeep)
 
     ## Unpack the specifics for this class, namely just the jobHandler
-    returnValue = (Input,self._externalRun(Input, jobHandler))
+    # When _externalRun raises (e.g. a sub-model fails during input
+    # creation), the unhandled exception kills the SharedMemoryRunner
+    # thread.  Because the thread's lambda never appends to the result
+    # queue, the run is detected as failed (returnCode -1) but the
+    # sampler/optimizer never receives a realization for it.  For
+    # population-based optimizers such as GeneticAlgorithm this causes
+    # a permanent hang: the optimizer waits for N realizations but
+    # only N-1 arrive.
+    #
+    # Fix: catch the exception and return a NaN-filled response so
+    # the thread completes normally.  The NaN values propagate into
+    # the optimizer's fitness evaluation where they are naturally
+    # penalized (e.g. feasibleFirst treats NaN objectives as the
+    # worst possible fitness).
+    try:
+      returnValue = (Input, self._externalRun(Input, jobHandler))
+    except Exception as e:
+      self.raiseAWarning(f'EnsembleModel evaluation failed (returning NaN fallback): {e}')
+      # _externalRun returns (returnDict, inRunTargetEvaluations, tempOutputs).
+      # collectOutput (line 465) unpacks evaluation[1] as this 3-tuple.
+      # Build the same structure with NaN-filled responses so the thread
+      # survives and the optimizer receives all N realizations.
+      nanOutcomes = {}
+      # Input[2] is the per-model kwargs dict built by createNewInput
+      nanKwargs = Input[2] if isinstance(Input, tuple) and len(Input) > 2 else {}
+      for modelIn in self.orderList:
+        nanVars = {}
+        modelKw = nanKwargs.get(modelIn, {}) if isinstance(nanKwargs, dict) else {}
+        # Copy all scalar/array metadata from kwargs, mirroring
+        # Code.evaluateSample's returnDict.update(kwargs).
+        # This includes ProbabilityWeight, ProbabilityWeight-<var>,
+        # PointProbability, etc. that the output DataObject expects.
+        for key, val in modelKw.items():
+          if key in ('SampledVars', 'SampledVarsPb'):
+            continue
+          try:
+            nanVars[key] = np.atleast_1d(val)
+          except (TypeError, ValueError):
+            pass
+        for var, val in modelKw.get('SampledVars', {}).items():
+          nanVars[var] = np.atleast_1d(val)
+        modelInstance = self.modelsDictionary[modelIn]['Instance']
+        if hasattr(modelInstance, 'workingDir') and modelInstance.workingDir:
+          nanVars['WORKING_DIR'] = np.atleast_1d(modelInstance.workingDir)
+        for var in self.modelsDictionary[modelIn]['Output']:
+          nanVars[var] = np.array([np.inf])
+        nanOutcomes[modelIn] = {'response': nanVars, 'general_metadata': {}}
+      returnValue = (Input, (nanOutcomes, {}, {}))
     return returnValue
 
   def submit(self,myInput,samplerType,jobHandler,**kwargs):
@@ -716,10 +763,44 @@ class EnsembleModel(Dummy):
         ##if self.runInfoDict and 'Code' == self.modelsDictionary[modelIn]['Instance'].type:
         ##  inputKwargs[modelIn].update(self.runInfoDict)
 
-        retDict, gotOuts, evaluation = self.__advanceModel(identifier, self.modelsDictionary[modelIn],
-                                                        originalInput[modelIn], inputKwargs[modelIn],
-                                                        inRunTargetEvaluations[modelIn], samplerType,
-                                                        iterationCount, jobHandler)
+        try:
+          retDict, gotOuts, evaluation = self.__advanceModel(identifier, self.modelsDictionary[modelIn],
+                                                          originalInput[modelIn], inputKwargs[modelIn],
+                                                          inRunTargetEvaluations[modelIn], samplerType,
+                                                          iterationCount, jobHandler)
+        except Exception as subModelExc:
+          # When a sub-model fails (e.g. PARCS input error, solver divergence),
+          # fill NaN for *this* model and all subsequent models in the chain,
+          # then break out of the model loop.  This mirrors how a regular Code
+          # model handles external-process failures: the evaluation completes
+          # normally with recognisable bad values instead of killing the thread.
+          self.raiseAWarning(
+            f'Sub-model "{modelIn}" failed in ensemble "{self.name}": {subModelExc}. '
+            f'Filling NaN for this and all remaining sub-models.')
+          for remCnt, remModel in enumerate(self.orderList[modelCnt:], start=modelCnt):
+            nanVars = {}
+            remKw = inputKwargs[remModel]
+            # Copy all scalar/array metadata from kwargs, mirroring
+            # Code.evaluateSample's returnDict.update(kwargs).
+            for key, val in remKw.items():
+              if key in ('SampledVars', 'SampledVarsPb'):
+                continue
+              try:
+                nanVars[key] = np.atleast_1d(val)
+              except (TypeError, ValueError):
+                pass
+            for var, val in remKw.get('SampledVars', {}).items():
+              nanVars[var] = np.atleast_1d(val)
+            modelInstance = self.modelsDictionary[remModel]['Instance']
+            if hasattr(modelInstance, 'workingDir') and modelInstance.workingDir:
+              nanVars['WORKING_DIR'] = np.atleast_1d(modelInstance.workingDir)
+            for var in self.modelsDictionary[remModel]['Output']:
+              nanVars[var] = np.array([np.inf])
+            returnDict[remModel] = {'response': nanVars, 'general_metadata': {}}
+            typeOutputs[remCnt] = inRunTargetEvaluations[remModel].type
+            gotOutputs[remCnt] = nanVars
+            tempOutputs[remModel] = None
+          break  # exit the model-order loop
 
         returnDict[modelIn] = retDict
         typeOutputs[modelCnt] = inRunTargetEvaluations[modelIn].type
@@ -794,9 +875,53 @@ class EnsembleModel(Dummy):
         # run the model
         inputKwargs.pop("jobHandler", None)
         modelToExecute['Instance'].submit(origInputList, samplerType, jobHandler, **inputKwargs)
-        ## wait until the model finishes, in order to get ready to run the subsequential one
-        while not jobHandler.isThisJobFinished(localIdentifier):
-          time.sleep(1.e-3)
+        ## Wait for the sub-model job to finish.
+        #
+        # Historical context (lock contention bug):
+        #   The original implementation polled isThisJobFinished() in a
+        #   while/sleep loop.  Each call acquires JobHandler.__queueLock.
+        #   With N evaluation threads (e.g. 100 GA populations) all
+        #   polling concurrently, the resulting N lock-requests/sec can
+        #   starve the single polling thread in JobHandler.startLoop(),
+        #   which also needs the lock to run fillJobQueue() and
+        #   cleanJobQueue().  When the polling thread is starved, jobs
+        #   that have already finished at the OS level never transition
+        #   from __running to __finished, causing a permanent hang.
+        #
+        # Fix:
+        #   Use a per-job threading.Event (created in reAddJob, set in
+        #   cleanJobQueue) so that waiting threads block on event.wait()
+        #   instead of acquiring the lock.  This eliminates contention
+        #   entirely on the wait path.
+        #
+        # The timeout on event.wait() serves two purposes:
+        #   1. Python's Event.wait(None) is not interruptible by Ctrl+C
+        #      or POSIX signals (CPython limitation); a finite timeout
+        #      ensures the thread periodically regains control.
+        #   2. Acts as a safety net in case the Event is somehow missed
+        #      (should not happen in normal operation).
+        #
+        # Backward compatibility:
+        #   If getJobEvent() returns None (unexpected), we fall back to
+        #   the original polling loop so that non-standard JobHandler
+        #   subclasses or configurations still work.
+        jobEvent = jobHandler.getJobEvent(localIdentifier)
+        if jobEvent is not None:
+          # [TRACE_EVENT] Debug log — remove after validation
+          self.raiseADebug(f'[TRACE_EVENT] Waiting on Event for job "{localIdentifier}" '
+                           f'(model: {modelToExecute["Instance"].name})')
+          while not jobEvent.wait(timeout=30.0):
+            # [TRACE_EVENT] Debug log — remove after validation
+            self.raiseADebug(f'[TRACE_EVENT] Still waiting for job "{localIdentifier}" '
+                             f'(event timeout, retrying)')
+          # [TRACE_EVENT] Debug log — remove after validation
+          self.raiseADebug(f'[TRACE_EVENT] Event received for job "{localIdentifier}"')
+        else:
+          # Fallback: original polling (should not be reached in normal use)
+          self.raiseAWarning(f'No Event found for job "{localIdentifier}", '
+                             f'falling back to polling-based wait')
+          while not jobHandler.isThisJobFinished(localIdentifier):
+            time.sleep(1.0)
         moveOn = True
       # get job that just finished to gather the results
       finishedRun = jobHandler.getFinished(jobIdentifier = localIdentifier, uniqueHandler=f"{self.name}{identifier}{suffix}")
@@ -808,10 +933,17 @@ class EnsembleModel(Dummy):
           # the failure happened at the input creation stage
           excType, excValue, excTrace = IOError, IOError("Failure happened at the input creation stage. See trace above"), None
         evaluation = None
-        # the model failed
-        for modelToRemove in list(set(self.orderList) - set([modelToExecute['Instance'].name])):
-          jobHandler.getFinished(jobIdentifier = f"{modelToRemove}{utils.returnIdSeparator()}{identifier}{suffix}",
-                                 uniqueHandler = f"{self.name}{identifier}{suffix}")
+        # the model failed — clean up only models that were submitted
+        # BEFORE the failed model (they may be running or finished).
+        # Models AFTER the failed one in orderList were never submitted,
+        # so calling getFinished for them would block indefinitely.
+        failedModelIdx = self.orderList.index(modelToExecute['Instance'].name)
+        for modelToRemove in self.orderList[:failedModelIdx]:
+          try:
+            jobHandler.getFinished(jobIdentifier = f"{modelToRemove}{utils.returnIdSeparator()}{identifier}{suffix}",
+                                   uniqueHandler = f"{self.name}{identifier}{suffix}")
+          except Exception:
+            pass  # best-effort cleanup
 
       else:
         # collect the target evaluation

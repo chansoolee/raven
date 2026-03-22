@@ -96,6 +96,26 @@ class CodeInterfaceBase(BaseInterface):
     """
     return self._runOnShell
 
+  def shouldSkipExecution(self):
+    """
+      Return True if the current evaluation needs no subprocess execution.
+
+      When this method returns True, Code.evaluateSample() will bypass
+      subprocess.Popen() entirely and proceed directly to output
+      finalization (checkForOutputFailure, finalizeCodeOutput) with
+      returnCode=0.  The code interface is then responsible for ensuring
+      that any output files expected by finalizeCodeOutput() have already
+      been written (typically in createNewInput).
+
+      This is a generic extension point — override in subclasses to
+      implement code-specific skip logic.  The base implementation always
+      returns False, preserving backward compatibility.
+
+      @ In, None
+      @ Out, shouldSkip, bool, True to skip subprocess execution
+    """
+    return False
+
   def getIfWriteCsv(self):
     """
       Returns self._writeCSV. True if a CSV is requested by the user even if

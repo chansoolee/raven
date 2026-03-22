@@ -30,6 +30,7 @@ import xarray as xr
 from ...utils import randomUtils
 from ...utils.EQChecker import EQChecker
 
+_eqCheckerCache = {}
 
 # @profile
 def onePointCrossover(parents,**kwargs):
@@ -103,7 +104,10 @@ def uniformCrossover(parents,**kwargs):
   EQFlag = False
   if any("prlodata" in sublist for sublist in kwargs["files"]):
     inpfile = [sublist[-1] for sublist in kwargs["files"] if sublist[1]=='prlodata'][0]
-    EQObject = EQChecker(inpfile.getPath()+inpfile.getFilename())
+    _filepath = inpfile.getPath() + inpfile.getFilename()
+    if _filepath not in _eqCheckerCache:
+      _eqCheckerCache[_filepath] = EQChecker(_filepath)
+    EQObject = _eqCheckerCache[_filepath]
     EQFlag = True if EQObject.prloData.calculationType in ["eq_cycle","eq_uprate"] else False
 
   index = 0

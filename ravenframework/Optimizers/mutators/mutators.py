@@ -29,6 +29,8 @@ from operator import itemgetter
 from ...utils import utils, randomUtils
 from ...utils.EQChecker import EQChecker
 
+_eqCheckerCache = {}
+
 def swapMutator(offSprings, distDict, **kwargs):
   """
     This method performs the swap mutator. For each child, two genes are sampled and switched
@@ -75,7 +77,10 @@ def swapMutatorEQ(offSprings, distDict, **kwargs):
   EQFlag = False
   if any("prlodata" in sublist for sublist in kwargs["files"]):
     inpfile = [sublist[-1] for sublist in kwargs["files"] if sublist[1]=='prlodata'][0]
-    EQObject = EQChecker(inpfile.getPath()+inpfile.getFilename())
+    _filepath = inpfile.getPath() + inpfile.getFilename()
+    if _filepath not in _eqCheckerCache:
+      _eqCheckerCache[_filepath] = EQChecker(_filepath)
+    EQObject = _eqCheckerCache[_filepath]
     symMult = EQObject.prloData.symmetricMultiplicity
     EQFlag = True if EQObject.prloData.calculationType in ["eq_cycle","eq_uprate"] else False
   if not EQFlag:
@@ -106,6 +111,19 @@ def swapMutatorEQ(offSprings, distDict, **kwargs):
         cdf2 = distDict[offSprings.coords['Gene'].values[loc2]].cdf(float(offSprings[i,loc2].values))
         children[i,loc1] = distDict[offSprings.coords['Gene'].values[loc1]].ppf(cdf2)
         children[i,loc2] = distDict[offSprings.coords['Gene'].values[loc2]].ppf(cdf1)
+        # Restore self-pointer invariant: fresh fuel (batch=1) src must equal current loc.
+        # Without this, two fresh-fuel locations that were swapped would point to each other,
+        # forming a cycle that crashes _trace_chain_to_fresh in determine_best_shuffling_scheme.
+        for swap_loc_0based in (loc1, loc2):
+          raw_faid = int(children[i, swap_loc_0based].values)
+          dec = EQObject.decodeFAID(raw_faid, EQObject.prloData.solnLen, EQObject.prloData.numBatches)
+          if dec[1] == 1:  # batch == 1 → fresh fuel: re-encode with src = current location
+            re_enc = EQObject.encodeFAID(
+              (swap_loc_0based + 1, dec[1], dec[2]),
+              EQObject.prloData.solnLen,
+              EQObject.prloData.numBatches,
+            )
+            children[i, swap_loc_0based] = float(re_enc)
         # update any reloaded FA's pointing to the swapped positions
         ##  check loc1
         decodedFA = EQObject.decodeFAID(int(offSprings[i,loc1].values), EQObject.prloData.solnLen, EQObject.prloData.numBatches)

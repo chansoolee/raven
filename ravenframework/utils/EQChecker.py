@@ -95,6 +95,11 @@ class EQChecker():
       dorm = ET.parse(fullFile)
       root = dorm.getroot()
 
+      # If elements are nested under a <PARCS> section, use that as the search root.
+      parcsNode = root.find('PARCS')
+      if parcsNode is not None:
+        root = parcsNode
+
       # Parse user-provided data from XML file
       #!TODO: define default values for missing params; list expected formats/units here.
       if verbosity in ['calcType','full','reduced']:
@@ -106,8 +111,7 @@ class EQChecker():
         self.colLabels = root.find('colLabels').text.strip()
         self.rowLabels = root.find('rowLabels').text.strip()
         self.geometry = root.find('geometry').text.strip()
-        #!self.coreShape = root.find('coreShape').text # DEPRECATED
-        self.coreShape = re.sub(r"\d{2}",'1',re.sub(r"r\d",'0',self.geometry.replace('00','  ')))
+        self.coreShape = re.sub(r"r\d", '0', re.sub(r"\d+", '1', self.geometry.replace('00', ' ')))
         self.solnLen = max([int(s) for s in self.geometry.split() if s.isdigit()])
         self.faDict = []
         for fa in root.iter('FA'):

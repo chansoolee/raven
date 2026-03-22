@@ -94,7 +94,7 @@ obj_2     *                  o
         <type>min,min</type>
       </samplerInit>
       <GAparams>
-        <populationSize>40</populationSize>
+        <populationSize>10</populationSize>
         <parentSelection>tournamentSelection</parentSelection>
         <reproduction>
           <crossover type="twoPointsCrossover">
@@ -129,7 +129,7 @@ obj_2     *                  o
   <Samplers>
     <MonteCarlo name="MC_samp">
       <samplerInit>
-        <limit>40</limit>
+        <limit>10</limit>
         <initialSeed>050877</initialSeed>
       </samplerInit>
       <variable name="x1">

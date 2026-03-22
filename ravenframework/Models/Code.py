@@ -405,12 +405,16 @@ class Code(Model):
     if brun is not None:
       # if batch, the subDir are a combination of prefix (batch id) and batch run id
       bid = kwargs['prefix'] if 'prefix' in kwargs.keys() else '1'
-      subDirectory = os.path.join(self.workingDir,'b{}_r{}'.format(bid,brun))
+      sep = utils.returnIdSeparator()
+      parts = bid.split(sep)
+      if len(parts) >= 3:
+        modelName, genIdx = parts[0], parts[1]
+        subDirectory = os.path.join(self.workingDir, modelName, f'gen_{genIdx}', f'pop_{brun}')
+      else:
+        subDirectory = os.path.join(self.workingDir, 'b{}_r{}'.format(bid, brun))
     else:
       subDirectory = os.path.join(self.workingDir, kwargs['prefix'] if 'prefix' in kwargs.keys() else '1')
-
-    if not os.path.exists(subDirectory):
-      os.mkdir(subDirectory)
+    os.makedirs(subDirectory, exist_ok=True)
     for index in range(len(newInputSet)):
       subSubDirectory = os.path.join(subDirectory,newInputSet[index].subDirectory)
       ## Currently, there are no tests that verify the lines below can be hit
@@ -649,78 +653,93 @@ class Code(Model):
     self.raiseADebug('self pid:' + str(os.getpid())+' ppid: '+str(os.getppid()))
     ## reset python path
     localenv.pop('PYTHONPATH',None)
-    ## This code should be evaluated by the job handler, so it is fine to wait
-    ## until the execution of the external subprocess completes.
-    process = utils.pickleSafeSubprocessPopen(command, shell=self.code.getRunOnShell(),
-                                              stdout=outFileObject, stderr=outFileObject,
-                                              cwd=localenv['PWD'], env=localenv)
-
-    # we create a variable that monitors the reason for the code stopping
-    # Options are:
-    # - Normal: Normal termination
-    # - Timeout: Timeout of the simulation in the driven code
-    # - StoppingCondtion: Normal Termination, Stopping condition triggered
-
-    # default is Normal
-    reasonStoppingCode = 'Normal'
-
-    # If we have either a wall time or an online stopping-criterion check, we need our custom loop.
-    if self.maxWallTime is not None or self.code.hasOnlineStopCriteriaCheck:
-      stoppingCriteriaTimeInterval = (
-            self.code.getOnlineStopCriteriaTimeInterval()
-            if self.code.hasOnlineStopCriteriaCheck else None
-      )
-      # If we have a maxWallTime, set up the "timeout" value
-      if self.maxWallTime is not None:
-        currentTime = time.time()
-        timeout = currentTime + self.maxWallTime
-      else:
-        timeout = None
-      # If we only have an online stop-criterion, give the underlying code
-      # some time to initialize before the first check
-      if self.maxWallTime is None and self.code.hasOnlineStopCriteriaCheck:
-        time.sleep(stoppingCriteriaTimeInterval)
-      # We'll record the last time we did a stop-criterion check
-      lastCheck = time.time()
-      while True:
-        # Decide how long to sleep this iteration:
-        #   - If we have a maxWallTime, we do short sleeps (0.5 sec)
-        #   - If no wallTime, we sleep the entire stop-check interval
-        sleepInterval = 0.5 if self.maxWallTime is not None else stoppingCriteriaTimeInterval
-        time.sleep(sleepInterval)
-        # Poll the subprocess to update its returncode if it finished
-        process.poll()
-        # 1) Check wall time, if applicable
-        if timeout is not None and time.time() > timeout and process.returncode is None:
-          self.raiseAWarning('walltime exceeded in run in working dir: '
-                             + str(metaData['subDirectory']) + '. Killing the run...')
-          process.kill()
-          process.returncode = -1
-          reasonStoppingCode = 'Timeout'
-        # 2) Check stop criteria, if applicable
-        #    We only check if we've gone at least `stoppingCriteriaTimeInterval`
-        #    since the last check
-        if (self.code.hasOnlineStopCriteriaCheck and stoppingCriteriaTimeInterval is not None):
-          if time.time() - lastCheck >= stoppingCriteriaTimeInterval:
-            stopSim = self.code.onlineStopCriteriaCheck(command, codeLogFile, metaData['subDirectory'])
-            if stopSim:
-              self.raiseAMessage(f'Code "{self.code.name}". Job ID: "{str(process.pid)}" '
-                                 f'(type: "{self.code.printTag}") triggered a stopping '
-                                 'criteria to halt the run. Return code is set to 0!')
-              process.kill()
-              process.returncode = 0
-              reasonStoppingCode = 'StoppingCondition'
-            lastCheck = time.time()
-        # 3) If the process has finished or we have (re-)exceeded the timeout, exit loop
-        if process.returncode is not None or (timeout is not None and time.time() > timeout):
-          break
-    # Otherwise, if no special checks are needed, just wait for the process to complete
+    # ------------------------------------------------------------------
+    # Optional subprocess bypass (generic CodeInterface extension point)
+    # ------------------------------------------------------------------
+    # Allow the code interface to declare that no external process is
+    # needed for the current evaluation.  This avoids fork() entirely,
+    # which prevents deadlocks in multi-threaded runs (parallelStrategy==2)
+    # where many threads fork concurrently and child processes inherit
+    # locks held by other threads that no longer exist in the child.
+    if self.code.shouldSkipExecution():
+      outFileObject.write('execution skipped by code interface\n')
+      outFileObject.flush()
+      returnCode = 0
+      self.raiseADebug('Code interface requested skip — no subprocess spawned')
+      reasonStoppingCode = 'Normal'
     else:
-      process.wait()
+      ## This code should be evaluated by the job handler, so it is fine to wait
+      ## until the execution of the external subprocess completes.
+      process = utils.pickleSafeSubprocessPopen(command, shell=self.code.getRunOnShell(),
+                                                stdout=outFileObject, stderr=outFileObject,
+                                                cwd=localenv['PWD'], env=localenv)
 
-    returnCode = process.returncode
-    self.raiseADebug(" Process "+str(process.pid)+" finished "+time.ctime()+
-                     " with returncode "+str(process.returncode))
+      # we create a variable that monitors the reason for the code stopping
+      # Options are:
+      # - Normal: Normal termination
+      # - Timeout: Timeout of the simulation in the driven code
+      # - StoppingCondtion: Normal Termination, Stopping condition triggered
+
+      # default is Normal
+      reasonStoppingCode = 'Normal'
+
+      # If we have either a wall time or an online stopping-criterion check, we need our custom loop.
+      if self.maxWallTime is not None or self.code.hasOnlineStopCriteriaCheck:
+        stoppingCriteriaTimeInterval = (
+              self.code.getOnlineStopCriteriaTimeInterval()
+              if self.code.hasOnlineStopCriteriaCheck else None
+        )
+        # If we have a maxWallTime, set up the "timeout" value
+        if self.maxWallTime is not None:
+          currentTime = time.time()
+          timeout = currentTime + self.maxWallTime
+        else:
+          timeout = None
+        # If we only have an online stop-criterion, give the underlying code
+        # some time to initialize before the first check
+        if self.maxWallTime is None and self.code.hasOnlineStopCriteriaCheck:
+          time.sleep(stoppingCriteriaTimeInterval)
+        # We'll record the last time we did a stop-criterion check
+        lastCheck = time.time()
+        while True:
+          # Decide how long to sleep this iteration:
+          #   - If we have a maxWallTime, we do short sleeps (0.5 sec)
+          #   - If no wallTime, we sleep the entire stop-check interval
+          sleepInterval = 0.5 if self.maxWallTime is not None else stoppingCriteriaTimeInterval
+          time.sleep(sleepInterval)
+          # Poll the subprocess to update its returncode if it finished
+          process.poll()
+          # 1) Check wall time, if applicable
+          if timeout is not None and time.time() > timeout and process.returncode is None:
+            self.raiseAWarning('walltime exceeded in run in working dir: '
+                               + str(metaData['subDirectory']) + '. Killing the run...')
+            process.kill()
+            process.returncode = -1
+            reasonStoppingCode = 'Timeout'
+          # 2) Check stop criteria, if applicable
+          #    We only check if we've gone at least `stoppingCriteriaTimeInterval`
+          #    since the last check
+          if (self.code.hasOnlineStopCriteriaCheck and stoppingCriteriaTimeInterval is not None):
+            if time.time() - lastCheck >= stoppingCriteriaTimeInterval:
+              stopSim = self.code.onlineStopCriteriaCheck(command, codeLogFile, metaData['subDirectory'])
+              if stopSim:
+                self.raiseAMessage(f'Code "{self.code.name}". Job ID: "{str(process.pid)}" '
+                                   f'(type: "{self.code.printTag}") triggered a stopping '
+                                   'criteria to halt the run. Return code is set to 0!')
+                process.kill()
+                process.returncode = 0
+                reasonStoppingCode = 'StoppingCondition'
+              lastCheck = time.time()
+          # 3) If the process has finished or we have (re-)exceeded the timeout, exit loop
+          if process.returncode is not None or (timeout is not None and time.time() > timeout):
+            break
+      # Otherwise, if no special checks are needed, just wait for the process to complete
+      else:
+        process.wait()
+
+      returnCode = process.returncode
+      self.raiseADebug(" Process "+str(process.pid)+" finished "+time.ctime()+
+                       " with returncode "+str(process.returncode))
     # procOutput = process.communicate()[0]
 
     ## If the returnCode is already non-zero, we should maintain our current
