@@ -532,54 +532,7 @@ class EnsembleModel(Dummy):
     Input = self.createNewInput(myInput[0], samplerType, **kwargsToKeep)
 
     ## Unpack the specifics for this class, namely just the jobHandler
-    # When _externalRun raises (e.g. a sub-model fails during input
-    # creation), the unhandled exception kills the SharedMemoryRunner
-    # thread.  Because the thread's lambda never appends to the result
-    # queue, the run is detected as failed (returnCode -1) but the
-    # sampler/optimizer never receives a realization for it.  For
-    # population-based optimizers such as GeneticAlgorithm this causes
-    # a permanent hang: the optimizer waits for N realizations but
-    # only N-1 arrive.
-    #
-    # Fix: catch the exception and return a NaN-filled response so
-    # the thread completes normally.  The NaN values propagate into
-    # the optimizer's fitness evaluation where they are naturally
-    # penalized (e.g. feasibleFirst treats NaN objectives as the
-    # worst possible fitness).
-    try:
-      returnValue = (Input, self._externalRun(Input, jobHandler))
-    except Exception as e:
-      self.raiseAWarning(f'EnsembleModel evaluation failed (returning NaN fallback): {e}')
-      # _externalRun returns (returnDict, inRunTargetEvaluations, tempOutputs).
-      # collectOutput (line 465) unpacks evaluation[1] as this 3-tuple.
-      # Build the same structure with NaN-filled responses so the thread
-      # survives and the optimizer receives all N realizations.
-      nanOutcomes = {}
-      # Input[2] is the per-model kwargs dict built by createNewInput
-      nanKwargs = Input[2] if isinstance(Input, tuple) and len(Input) > 2 else {}
-      for modelIn in self.orderList:
-        nanVars = {}
-        modelKw = nanKwargs.get(modelIn, {}) if isinstance(nanKwargs, dict) else {}
-        # Copy all scalar/array metadata from kwargs, mirroring
-        # Code.evaluateSample's returnDict.update(kwargs).
-        # This includes ProbabilityWeight, ProbabilityWeight-<var>,
-        # PointProbability, etc. that the output DataObject expects.
-        for key, val in modelKw.items():
-          if key in ('SampledVars', 'SampledVarsPb'):
-            continue
-          try:
-            nanVars[key] = np.atleast_1d(val)
-          except (TypeError, ValueError):
-            pass
-        for var, val in modelKw.get('SampledVars', {}).items():
-          nanVars[var] = np.atleast_1d(val)
-        modelInstance = self.modelsDictionary[modelIn]['Instance']
-        if hasattr(modelInstance, 'workingDir') and modelInstance.workingDir:
-          nanVars['WORKING_DIR'] = np.atleast_1d(modelInstance.workingDir)
-        for var in self.modelsDictionary[modelIn]['Output']:
-          nanVars[var] = np.array([np.inf])
-        nanOutcomes[modelIn] = {'response': nanVars, 'general_metadata': {}}
-      returnValue = (Input, (nanOutcomes, {}, {}))
+    returnValue = (Input,self._externalRun(Input, jobHandler))
     return returnValue
 
   def submit(self,myInput,samplerType,jobHandler,**kwargs):
@@ -763,44 +716,10 @@ class EnsembleModel(Dummy):
         ##if self.runInfoDict and 'Code' == self.modelsDictionary[modelIn]['Instance'].type:
         ##  inputKwargs[modelIn].update(self.runInfoDict)
 
-        try:
-          retDict, gotOuts, evaluation = self.__advanceModel(identifier, self.modelsDictionary[modelIn],
-                                                          originalInput[modelIn], inputKwargs[modelIn],
-                                                          inRunTargetEvaluations[modelIn], samplerType,
-                                                          iterationCount, jobHandler)
-        except Exception as subModelExc:
-          # When a sub-model fails (e.g. PARCS input error, solver divergence),
-          # fill NaN for *this* model and all subsequent models in the chain,
-          # then break out of the model loop.  This mirrors how a regular Code
-          # model handles external-process failures: the evaluation completes
-          # normally with recognisable bad values instead of killing the thread.
-          self.raiseAWarning(
-            f'Sub-model "{modelIn}" failed in ensemble "{self.name}": {subModelExc}. '
-            f'Filling NaN for this and all remaining sub-models.')
-          for remCnt, remModel in enumerate(self.orderList[modelCnt:], start=modelCnt):
-            nanVars = {}
-            remKw = inputKwargs[remModel]
-            # Copy all scalar/array metadata from kwargs, mirroring
-            # Code.evaluateSample's returnDict.update(kwargs).
-            for key, val in remKw.items():
-              if key in ('SampledVars', 'SampledVarsPb'):
-                continue
-              try:
-                nanVars[key] = np.atleast_1d(val)
-              except (TypeError, ValueError):
-                pass
-            for var, val in remKw.get('SampledVars', {}).items():
-              nanVars[var] = np.atleast_1d(val)
-            modelInstance = self.modelsDictionary[remModel]['Instance']
-            if hasattr(modelInstance, 'workingDir') and modelInstance.workingDir:
-              nanVars['WORKING_DIR'] = np.atleast_1d(modelInstance.workingDir)
-            for var in self.modelsDictionary[remModel]['Output']:
-              nanVars[var] = np.array([np.inf])
-            returnDict[remModel] = {'response': nanVars, 'general_metadata': {}}
-            typeOutputs[remCnt] = inRunTargetEvaluations[remModel].type
-            gotOutputs[remCnt] = nanVars
-            tempOutputs[remModel] = None
-          break  # exit the model-order loop
+        retDict, gotOuts, evaluation = self.__advanceModel(identifier, self.modelsDictionary[modelIn],
+                                                        originalInput[modelIn], inputKwargs[modelIn],
+                                                        inRunTargetEvaluations[modelIn], samplerType,
+                                                        iterationCount, jobHandler)
 
         returnDict[modelIn] = retDict
         typeOutputs[modelCnt] = inRunTargetEvaluations[modelIn].type
