@@ -819,8 +819,6 @@ class JobHandler(BaseType):
       # of polling isThisJobFinished().  Created inside the lock to
       # guarantee the event exists before cleanJobQueue() could set it.
       self.__jobEvents[runner.identifier] = threading.Event()
-      # [TRACE_EVENT] Debug log for Event lifecycle tracking — remove after validation
-      self.raiseADebug(f'[TRACE_EVENT] Created completion Event for job "{runner.identifier}"')
       if not runner.clientRunner:
         self.__queue.append(runner)
       else:
@@ -1004,9 +1002,8 @@ class JobHandler(BaseType):
     identifier = identifier.strip()
     with self.__queueLock:
       event = self.__jobEvents.get(identifier)
-      # [TRACE_EVENT] Debug log — remove after validation
       if event is None:
-        self.raiseADebug(f'[TRACE_EVENT] getJobEvent: no Event found for "{identifier}"')
+        self.raiseADebug(f'getJobEvent: no Event found for "{identifier}"')
       return event
 
   def areTheseJobsFinished(self, uniqueHandler="any"):
@@ -1282,8 +1279,6 @@ class JobHandler(BaseType):
             event = self.__jobEvents.get(run.identifier)
             if event is not None:
               event.set()
-              # [TRACE_EVENT] Debug log — remove after validation
-              self.raiseADebug(f'[TRACE_EVENT] Event signaled for finished job "{run.identifier}"')
 
   def setProfileJobs(self,profile=False):
     """

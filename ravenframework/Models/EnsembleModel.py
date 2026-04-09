@@ -826,15 +826,8 @@ class EnsembleModel(Dummy):
         #   subclasses or configurations still work.
         jobEvent = jobHandler.getJobEvent(localIdentifier)
         if jobEvent is not None:
-          # [TRACE_EVENT] Debug log — remove after validation
-          self.raiseADebug(f'[TRACE_EVENT] Waiting on Event for job "{localIdentifier}" '
-                           f'(model: {modelToExecute["Instance"].name})')
           while not jobEvent.wait(timeout=30.0):
-            # [TRACE_EVENT] Debug log — remove after validation
-            self.raiseADebug(f'[TRACE_EVENT] Still waiting for job "{localIdentifier}" '
-                             f'(event timeout, retrying)')
-          # [TRACE_EVENT] Debug log — remove after validation
-          self.raiseADebug(f'[TRACE_EVENT] Event received for job "{localIdentifier}"')
+            pass
         else:
           # Fallback: original polling (should not be reached in normal use)
           self.raiseAWarning(f'No Event found for job "{localIdentifier}", '

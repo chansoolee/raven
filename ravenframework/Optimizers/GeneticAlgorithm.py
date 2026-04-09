@@ -1119,6 +1119,34 @@ class GeneticAlgorithm(RavenSampled):
         bestRlz.update(self.bestPoint)
       self._optPointHistory[traj].append((bestRlz, info))
 
+    # Prune old generation data from TargetEvaluation to prevent unbounded
+    # memory growth.  GA only reads the current batchId from this DataObject
+    # (see localFinalizeActualSampling), so past generations can be safely
+    # discarded once the new generation has been fully resolved.
+    self._pruneTargetEvaluation()
+
+  def _pruneTargetEvaluation(self):
+    """
+      Clear all entries from _targetEvaluation to free memory.
+
+      After the current generation is fully resolved, its data has already been
+      read and processed by _useRealization / _resolveNewGeneration.  The next
+      generation will populate fresh entries with a new batchId, so nothing in
+      _targetEvaluation is needed anymore.  This prevents O(generations * popSize)
+      memory accumulation that causes OOM on large runs.
+    """
+    te = self._targetEvaluation
+    if te is None:
+      return
+    try:
+      nBefore = te.size
+      if nBefore == 0:
+        return
+      te.reset()
+      self.raiseADebug(f'TargetEvaluation pruned: {nBefore} -> 0 entries (cleared after generation resolved)')
+    except Exception as e:
+      self.raiseAWarning(f'TargetEvaluation pruning skipped: {e}')
+
   def _collectOptPoint(self, rlz, fitness, objectiveVal, g):
     """
       Collects the point (dict) from a realization
